@@ -55,6 +55,26 @@ public class UserDirectoryClient {
         }
     }
 
+    /**
+     * Resolves the identity behind a signed-in principal. The JWT carries only the email, so
+     * self-service endpoints ("my payslips") need this to reach the employee record.
+     */
+    public UserSummaryDto getByEmail(String email) {
+        if (email == null || email.isBlank()) {
+            return null;
+        }
+        try {
+            return restClient.get()
+                    .uri(uriBuilder ->
+                            uriBuilder.path("/users/by-email").queryParam("email", email).build())
+                    .retrieve()
+                    .body(UserSummaryDto.class);
+        } catch (Exception e) {
+            log.warn("User lookup by email failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     /** Resolves a single user summary by identity id, or null on miss / lookup failure. */
     public UserSummaryDto getSummary(Long id) {
         if (id == null) {

@@ -22,6 +22,18 @@ public interface PayslipRepository extends JpaRepository<Payslip, Long> {
 
     List<Payslip> findByPayrollRunId(Long runId);
 
+    /**
+     * One employee's own payslips, newest first. Only released runs — a payslip from a draft or
+     * merely generated run is still being worked on and must not be visible to the employee.
+     */
+    @Query("""
+        SELECT p FROM Payslip p
+        WHERE p.employeeId = :employeeId
+          AND p.payrollRun.status = 'released'
+        ORDER BY p.periodEnd DESC
+        """)
+    Page<Payslip> findMine(@Param("employeeId") String employeeId, Pageable pageable);
+
     @Query("SELECT COALESCE(SUM(p.incentives),0) FROM Payslip p WHERE p.payrollRun.status = 'released'")
     BigDecimal sumReleasedIncentives();
 

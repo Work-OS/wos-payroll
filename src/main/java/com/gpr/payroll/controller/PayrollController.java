@@ -13,10 +13,20 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 
+/**
+ * Payroll runs and payslips.
+ *
+ * <p>No class-level path on purpose: the service's {@code context-path} is already
+ * {@code /api/payroll}, so a {@code @RequestMapping("/payroll")} here would put every endpoint at
+ * {@code /api/payroll/payroll/...} — which is what happened, and why these routes 404'd into the
+ * catch-all exception handler as 500s. {@code RewardsController} maps {@code /rewards} because that
+ * genuinely is a sub-resource; these are the payroll root.
+ */
 @RestController
-@RequestMapping("/payroll")
 @RequiredArgsConstructor
 public class PayrollController {
     private final PayrollService payrollService;
@@ -35,13 +45,29 @@ public class PayrollController {
         return ResponseEntity.ok(payrollService.getRuns(page, size));
     }
 
-    @PostMapping("/runs")
-    @PreAuthorize("isAuthenticated()")
-    public ResponseEntity<PayrollRun> createRun(@RequestBody Map<String, String> body) {
-        LocalDate start = LocalDate.parse(body.get("periodStart"));
-        LocalDate end = LocalDate.parse(body.get("periodEnd"));
-        return ResponseEntity.ok(payrollService.createRun(start, end));
+    /**
+     * Who a run would cover, what each would be paid for the period, and who'd be skipped and why —
+     * all before the run exists. Amounts come from the same computation the run itself uses.
+     */
+    @GetMapping("/runs/preview")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:MANAGE_PAYROLL')")
+    public ResponseEntity<List<PayrollService.RunCandidate>> previewRun(
+            @RequestParam String periodStart, @RequestParam String periodEnd) {
+        return ResponseEntity.ok(payrollService.previewCandidates(
+                LocalDate.parse(periodStart), LocalDate.parse(periodEnd)));
     }
+
+    /** {@code includedUserIds} omitted or empty covers every eligible employee. */
+    @PostMapping("/runs")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:MANAGE_PAYROLL')")
+    public ResponseEntity<PayrollRun> createRun(@RequestBody CreateRunRequest body) {
+        return ResponseEntity.ok(payrollService.createRun(
+                LocalDate.parse(body.periodStart()),
+                LocalDate.parse(body.periodEnd()),
+                body.includedUserIds()));
+    }
+
+    public record CreateRunRequest(String periodStart, String periodEnd, List<Long> includedUserIds) {}
 
     @GetMapping("/runs/{id}/steps")
     @PreAuthorize("isAuthenticated()")
@@ -61,8 +87,22 @@ public class PayrollController {
         return ResponseEntity.ok(payrollService.releaseRun(id));
     }
 
+    /**
+     * The signed-in employee's own payslips. Separate from the admin listing below so self-service
+     * never needs an authority that would also expose everyone else's pay.
+     */
+    @GetMapping("/payslips/me")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL:VIEW_PAYSLIP')")
+    public ResponseEntity<Page<Payslip>> getMyPayslips(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        return ResponseEntity.ok(payrollService.getMyPayslips(userDetails.getUsername(), page, size));
+    }
+
+    /** Every payslip in the company — admin listing, hence the management authority. */
     @GetMapping("/payslips")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:VIEW_ALL_PAYSLIPS')")
     public ResponseEntity<Page<Payslip>> getPayslips(
             @RequestParam(required = false) Long runId,
             @RequestParam(required = false) String status,

@@ -14,18 +14,22 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class PayrollService {
@@ -61,6 +65,8 @@ public class PayrollService {
     private final ObjectMapper             objectMapper;
     private final com.gpr.payroll.client.UserDirectoryClient userDirectory;
     private final OvertimePayCalculator    overtimePayCalculator;
+    private final UnpaidLeaveCalculator    unpaidLeaveCalculator;
+    private final SalaryResolver           salaryResolver;
 
     // ── Stats ─────────────────────────────────────────────────────────────────
 
@@ -91,7 +97,7 @@ public class PayrollService {
     }
 
     @Transactional
-    public PayrollRun createRun(LocalDate periodStart, LocalDate periodEnd) {
+    public PayrollRun createRun(LocalDate periodStart, LocalDate periodEnd, List<Long> includedUserIds) {
         String creator = SecurityContextHolder.getContext().getAuthentication().getName();
         String period  = periodStart.format(DateTimeFormatter.ofPattern("MMMM yyyy"));
 
@@ -99,6 +105,11 @@ public class PayrollService {
                 .period(period)
                 .periodStart(periodStart)
                 .periodEnd(periodEnd)
+                // Null/empty is stored as null and read back as "everyone", preserving the previous
+                // behaviour for callers that don't select.
+                .includedUserIds(includedUserIds == null || includedUserIds.isEmpty()
+                        ? null
+                        : includedUserIds.stream().map(String::valueOf).collect(Collectors.joining(",")))
                 .status("draft")
                 .createdBy(creator)
                 .build();
@@ -123,13 +134,122 @@ public class PayrollService {
         return stepRepo.findByPayrollRunIdOrderByStepOrder(runId);
     }
 
+    // ── Run preview ───────────────────────────────────────────────────────────
+
+    /**
+     * One candidate for a run: what they'd be paid for the period, or why they can't be.
+     * {@code salarySource} says whether the figure came from their contract or the position grade,
+     * so an unexpected amount can be traced without opening two other screens.
+     */
+    public record RunCandidate(
+            Long userId,
+            String employeeId,
+            String name,
+            String position,
+            BigDecimal monthlySalary,
+            String salarySource,
+            BigDecimal basicSalary,
+            BigDecimal allowances,
+            BigDecimal overtimePay,
+            BigDecimal grossPay,
+            /** Unpaid leave for the period — broken out because it's the line people query. */
+            BigDecimal absences,
+            BigDecimal statutoryDeductions,
+            BigDecimal totalDeductions,
+            BigDecimal netPay,
+            boolean eligible,
+            String reason) {}
+
+    /**
+     * Who a run would cover, before creating it.
+     *
+     * <p>{@code processRun} silently skips anyone without a primary position or an active payroll
+     * setup, so a run could quietly pay fewer people than expected with nothing to show for it.
+     * This surfaces those cases with a reason so they can be fixed rather than discovered later in
+     * a short payslip count.
+     */
+    public List<RunCandidate> previewCandidates(LocalDate periodStart, LocalDate periodEnd) {
+        List<User> employees = userRepo.findByActiveTrue();
+        Map<Long, com.gpr.kernel.dto.UserSummaryDto> summaries =
+                userDirectory.getSummaries(employees.stream().map(User::getUserId).toList());
+
+        List<RunCandidate> out = new ArrayList<>();
+        for (User emp : employees) {
+            com.gpr.kernel.dto.UserSummaryDto s = summaries.get(emp.getUserId());
+            String name = s == null
+                    ? emp.getEmployeeId()
+                    : ((s.getFirstName() == null ? "" : s.getFirstName()) + " "
+                            + (s.getLastName() == null ? "" : s.getLastName())).trim();
+
+            // A position is still required — it's what a payslip is labelled with, and what the
+            // allowance/deduction template hangs off.
+            List<UserPosition> positions = userPositionRepo.findPrimaryActiveByUserId(emp.getId());
+            if (positions.isEmpty()) {
+                out.add(unpayable(emp, name, null, "No primary position assigned"));
+                continue;
+            }
+            JobPosition position = positions.get(0).getJobPosition();
+
+            // Optional now: without it there are simply no allowances or named deductions.
+            com.gpr.payroll.entity.PayrollSetup setup =
+                    payrollSetupRepo.findActiveByJobPositionId(position.getId()).stream()
+                            .max(Comparator.comparing(x ->
+                                    x.getEffectiveDate() != null ? x.getEffectiveDate() : LocalDate.MIN))
+                            .orElse(null);
+
+            SalaryResolver.Resolved pay = salaryResolver.resolve(emp.getUserId(), setup, periodEnd);
+            if (!pay.payable()) {
+                out.add(unpayable(emp, name, position.getTitle(), pay.problem()));
+                continue;
+            }
+
+            // Run the real computation rather than an approximation — a preview that disagrees with
+            // the run it previews is worse than none.
+            Payslip p = computePayslip(emp, position, setup, periodStart, periodEnd, s);
+            out.add(new RunCandidate(
+                    emp.getUserId(), emp.getEmployeeId(), name, position.getTitle(),
+                    pay.monthly(), pay.source(),
+                    p.getBasicSalary(), p.getIncentives(), p.getOvertimePay(), p.getGrossPay(),
+                    p.getAbsences(),
+                    nvl(p.getSss()).add(nvl(p.getPhilhealth()))
+                            .add(nvl(p.getPagibig())).add(nvl(p.getTax())),
+                    p.getTotalDeductions(), p.getNetPay(), true, null));
+        }
+        out.sort(Comparator.comparing(c -> c.name() == null ? "" : c.name().toLowerCase()));
+        return out;
+    }
+
+    private static RunCandidate unpayable(User emp, String name, String position, String reason) {
+        return new RunCandidate(emp.getUserId(), emp.getEmployeeId(), name, position,
+                null, null, null, null, null, null, null, null, null, null, false, reason);
+    }
+
+    /** Comma-separated ids → set; blank means "everyone", not "nobody". */
+    private static Set<Long> parseIncluded(String csv) {
+        if (csv == null || csv.isBlank()) return Set.of();
+        Set<Long> ids = new LinkedHashSet<>();
+        for (String part : csv.split(",")) {
+            try {
+                ids.add(Long.parseLong(part.trim()));
+            } catch (NumberFormatException ignored) {
+                // A malformed id is dropped rather than failing the run.
+            }
+        }
+        return ids;
+    }
+
     @Transactional
     public PayrollRun processRun(Long runId) {
         PayrollRun run = runRepo.findById(runId).orElseThrow();
         run.setStatus("processing");
         run.setProcessedAt(LocalDateTime.now());
 
-        List<User> employees = userRepo.findByActiveTrue();
+        // Honour an explicit selection made when the run was created; empty means everyone.
+        Set<Long> selected = parseIncluded(run.getIncludedUserIds());
+        List<User> employees = userRepo.findByActiveTrue().stream()
+                .filter(u -> selected.isEmpty() || selected.contains(u.getUserId()))
+                .toList();
+
         List<Payslip> payslips = new ArrayList<>();
         BigDecimal total = BigDecimal.ZERO;
 
@@ -141,20 +261,30 @@ public class PayrollService {
         for (User emp : employees) {
             // Resolve primary active position
             List<UserPosition> positions = userPositionRepo.findPrimaryActiveByUserId(emp.getId());
-            if (positions.isEmpty()) continue;
+            if (positions.isEmpty()) {
+                log.warn("Skipping user {} in run {} — no primary position", emp.getUserId(), runId);
+                continue;
+            }
             JobPosition position = positions.get(0).getJobPosition();
 
-            // Find the most recently effective active PayrollSetup for this position
-            List<com.gpr.payroll.entity.PayrollSetup> setups =
-                    payrollSetupRepo.findActiveByJobPositionId(position.getId());
-            if (setups.isEmpty()) continue;
+            // Optional: supplies allowances and named deductions, but no longer gates payment.
+            com.gpr.payroll.entity.PayrollSetup setup =
+                    payrollSetupRepo.findActiveByJobPositionId(position.getId()).stream()
+                            .max(Comparator.comparing(s ->
+                                    s.getEffectiveDate() != null ? s.getEffectiveDate() : LocalDate.MIN))
+                            .orElse(null);
 
-            com.gpr.payroll.entity.PayrollSetup setup = setups.stream()
-                    .max(Comparator.comparing(s ->
-                            s.getEffectiveDate() != null ? s.getEffectiveDate() : LocalDate.MIN))
-                    .orElseThrow();
+            SalaryResolver.Resolved pay =
+                    salaryResolver.resolve(emp.getUserId(), setup, run.getPeriodEnd());
+            if (!pay.payable()) {
+                // Logged rather than silently dropped — the run preview shows the same reason.
+                log.warn("Skipping user {} in run {} — {}", emp.getUserId(), runId, pay.problem());
+                continue;
+            }
 
-            Payslip p = computePayslip(emp, position, setup, run, summaries.get(emp.getUserId()));
+            Payslip p = computePayslip(emp, position, setup,
+                    run.getPeriodStart(), run.getPeriodEnd(), summaries.get(emp.getUserId()));
+            p.setPayrollRun(run);
             payslips.add(p);
             total = total.add(p.getNetPay());
         }
@@ -205,25 +335,60 @@ public class PayrollService {
         return payslipRepo.findById(id).orElseThrow();
     }
 
+    /**
+     * The signed-in employee's own payslips, released runs only.
+     *
+     * <p>The JWT carries just the email, so this resolves email → identity → employment record to
+     * reach the employee number payslips are keyed by. An employee with no employment record (or an
+     * unresolvable identity) gets an empty page rather than an error — nothing to show is a normal
+     * state for someone who has never been paid.
+     */
+    public Page<Payslip> getMyPayslips(String email, int page, int size) {
+        Pageable pageable = PageRequest.of(page, size);
+        com.gpr.kernel.dto.UserSummaryDto identity = userDirectory.getByEmail(email);
+        if (identity == null || identity.getId() == null) return Page.empty(pageable);
+
+        List<User> employments = userRepo.findByUserId(identity.getId());
+        if (employments.isEmpty()) return Page.empty(pageable);
+        if (employments.size() > 1) {
+            // The token has no companyId claim, so a multi-company identity can't be disambiguated
+            // here. Rare in practice; logged so it's visible rather than silently wrong.
+            log.warn("Identity {} has {} employment records — using the first for payslip lookup",
+                    identity.getId(), employments.size());
+        }
+        return payslipRepo.findMine(employments.get(0).getEmployeeId(), pageable);
+    }
+
     // ── Payslip computation ───────────────────────────────────────────────────
 
+    /**
+     * Builds a payslip for one employee over a period. The run is attached by the caller, so this
+     * can also be used to preview amounts before a run exists.
+     *
+     * @param setup may be null — the position's payroll setup supplies allowances, named
+     *     deductions and the cutoff basis, but no longer gates whether someone can be paid.
+     */
     private Payslip computePayslip(User emp, JobPosition position,
-                                   com.gpr.payroll.entity.PayrollSetup setup, PayrollRun run,
+                                   com.gpr.payroll.entity.PayrollSetup setup,
+                                   LocalDate periodStart, LocalDate periodEnd,
                                    com.gpr.kernel.dto.UserSummaryDto empSummary) {
-        String basis        = setup.getCompensationBasis();
-        BigDecimal monthly  = nvl(setup.getBaseSalary());
+        String basis        = setup == null ? null : setup.getCompensationBasis();
+        // Pay comes from what the employee signed; the position's grade is only a fallback.
+        BigDecimal monthly  = nvl(salaryResolver.resolve(emp.getUserId(), setup, periodEnd).monthly());
 
         // Basic salary for this pay period
-        BigDecimal basic    = periodAmount(monthly, basis, run.getPeriodStart(), run.getPeriodEnd());
+        BigDecimal basic    = periodAmount(monthly, basis, periodStart, periodEnd);
 
         // Allowances (stored in incentives field for display)
-        BigDecimal allowances = sumLineItems(setup.getAllowancesJson(), basic);
+        BigDecimal allowances = setup == null
+                ? BigDecimal.ZERO
+                : sumLineItems(setup.getAllowancesJson(), basic);
 
         // Overtime + holiday/rest-day premium pay from the employee's approved claims for this period,
         // valued at the company's configured multipliers, itemised per type.
         OvertimePayCalculator.Result ot = overtimePayCalculator.compute(
                 emp.getUserId(), emp.getCompanyId(), monthly,
-                run.getPeriodStart(), run.getPeriodEnd());
+                periodStart, periodEnd);
         BigDecimal overtimePay = ot.total();
 
         BigDecimal gross      = basic.add(allowances).add(overtimePay);
@@ -238,26 +403,33 @@ public class PayrollService {
         BigDecimal tax        = scale(computeWithholdingTax(taxable),  basis);
 
         // Named deductions from the setup (e.g. cash advance, company loan)
-        BigDecimal named      = sumLineItems(setup.getDeductionsJson(), basic);
+        BigDecimal named      = setup == null ? BigDecimal.ZERO : sumLineItems(setup.getDeductionsJson(), basic);
 
-        BigDecimal totalDed   = sss.add(phi).add(pag).add(tax).add(named);
+        // Approved leave whose type the company marks unpaid (LWOP by default) — days not worked
+        // and not covered by credit, so they come off the pay.
+        UnpaidLeaveCalculator.Result unpaid = unpaidLeaveCalculator.compute(
+                emp.getUserId(), emp.getCompanyId(), monthly,
+                periodStart, periodEnd);
+
+        BigDecimal totalDed   = sss.add(phi).add(pag).add(tax).add(named).add(unpaid.amount());
         BigDecimal net        = gross.subtract(totalDed).max(BigDecimal.ZERO);
 
         String employeeName = empSummary == null ? emp.getEmployeeId()
                 : ((empSummary.getFirstName() == null ? "" : empSummary.getFirstName())
                         + " " + (empSummary.getLastName() == null ? "" : empSummary.getLastName())).trim();
         return Payslip.builder()
-                .payrollRun(run)
+
                 .employeeId(emp.getEmployeeId())
                 .employeeName(employeeName)
-                .position(position.getTitle())
-                .periodStart(run.getPeriodStart())
-                .periodEnd(run.getPeriodEnd())
+                .position(position == null ? null : position.getTitle())
+                .periodStart(periodStart)
+                .periodEnd(periodEnd)
                 .basicSalary(basic)
                 .incentives(allowances)
                 .overtimePay(overtimePay)
                 .overtimeBreakdown(ot.lines())
                 .grossPay(gross)
+                .absences(unpaid.amount())
                 .sss(sss)
                 .philhealth(phi)
                 .pagibig(pag)

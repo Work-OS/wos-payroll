@@ -28,4 +28,10 @@ public interface UserRepository extends JpaRepository<User, Long> {
     List<User> findActiveByRoleName(@Param("roleName") String roleName);
 
     List<User> findByActiveTrue();
+
+    /**
+     * Employment records for an identity. Returns a list because {@code (user_id, company_id)} is
+     * the unique key — one person can be employed by more than one company.
+     */
+    List<User> findByUserId(Long userId);
 }
