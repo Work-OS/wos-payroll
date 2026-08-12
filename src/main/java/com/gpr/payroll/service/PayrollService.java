@@ -150,11 +150,19 @@ public class PayrollService {
             String salarySource,
             BigDecimal basicSalary,
             BigDecimal allowances,
+            /** Per-item allowances, so the payslip shows what the total is made of. */
+            List<PayslipLine> allowanceLines,
             BigDecimal overtimePay,
+            /** Per-type overtime/premium lines (regular OT, rest day, holiday…). */
+            List<PayslipOvertimeLine> overtimeLines,
             BigDecimal grossPay,
             /** Unpaid leave for the period — broken out because it's the line people query. */
             BigDecimal absences,
             BigDecimal statutoryDeductions,
+            /** SSS / PhilHealth / Pag-IBIG / withholding tax, itemised. */
+            List<PayslipLine> statutoryLines,
+            /** Company-defined deductions (loans, cash advances…), itemised. */
+            List<PayslipLine> deductionLines,
             BigDecimal totalDeductions,
             BigDecimal netPay,
             boolean eligible,
@@ -209,10 +217,12 @@ public class PayrollService {
             out.add(new RunCandidate(
                     emp.getUserId(), emp.getEmployeeId(), name, position.getTitle(),
                     pay.monthly(), pay.source(),
-                    p.getBasicSalary(), p.getIncentives(), p.getOvertimePay(), p.getGrossPay(),
+                    p.getBasicSalary(), p.getIncentives(), p.getAllowanceLines(),
+                    p.getOvertimePay(), p.getOvertimeBreakdown(), p.getGrossPay(),
                     p.getAbsences(),
                     nvl(p.getSss()).add(nvl(p.getPhilhealth()))
                             .add(nvl(p.getPagibig())).add(nvl(p.getTax())),
+                    statutoryLines(p), p.getDeductionLines(),
                     p.getTotalDeductions(), p.getNetPay(), true, null));
         }
         out.sort(Comparator.comparing(c -> c.name() == null ? "" : c.name().toLowerCase()));
@@ -221,7 +231,25 @@ public class PayrollService {
 
     private static RunCandidate unpayable(User emp, String name, String position, String reason) {
         return new RunCandidate(emp.getUserId(), emp.getEmployeeId(), name, position,
-                null, null, null, null, null, null, null, null, null, null, false, reason);
+                null, null, null, null, List.of(), null, List.of(), null, null, null,
+                List.of(), List.of(), null, null, false, reason);
+    }
+
+    /**
+     * The statutory contributions as named lines. They live in their own typed columns — remittance
+     * reporting needs them typed — so they're projected into lines only for display, rather than
+     * being stored twice and risking the two copies disagreeing.
+     */
+    private static List<PayslipLine> statutoryLines(Payslip p) {
+        List<PayslipLine> lines = new ArrayList<>();
+        if (nvl(p.getSss()).signum() != 0) lines.add(new PayslipLine("SSS", p.getSss()));
+        if (nvl(p.getPhilhealth()).signum() != 0)
+            lines.add(new PayslipLine("PhilHealth", p.getPhilhealth()));
+        if (nvl(p.getPagibig()).signum() != 0)
+            lines.add(new PayslipLine("Pag-IBIG / HDMF", p.getPagibig()));
+        if (nvl(p.getTax()).signum() != 0)
+            lines.add(new PayslipLine("Withholding tax (BIR)", p.getTax()));
+        return lines;
     }
 
     /** Comma-separated ids → set; blank means "everyone", not "nobody". */
@@ -379,10 +407,11 @@ public class PayrollService {
         // Basic salary for this pay period
         BigDecimal basic    = periodAmount(monthly, basis, periodStart, periodEnd);
 
-        // Allowances (stored in incentives field for display)
-        BigDecimal allowances = setup == null
-                ? BigDecimal.ZERO
-                : sumLineItems(setup.getAllowancesJson(), basic);
+        // Allowances (stored in incentives field for display), kept itemised alongside the total.
+        List<PayslipLine> allowanceLines = setup == null
+                ? List.of()
+                : resolveLineItems(setup.getAllowancesJson(), basic, "allowance");
+        BigDecimal allowances = sumLines(allowanceLines);
 
         // Overtime + holiday/rest-day premium pay from the employee's approved claims for this period,
         // valued at the company's configured multipliers, itemised per type.
@@ -402,8 +431,11 @@ public class PayrollService {
                                        .subtract(computePagibig(monthly));
         BigDecimal tax        = scale(computeWithholdingTax(taxable),  basis);
 
-        // Named deductions from the setup (e.g. cash advance, company loan)
-        BigDecimal named      = setup == null ? BigDecimal.ZERO : sumLineItems(setup.getDeductionsJson(), basic);
+        // Named deductions from the setup (e.g. cash advance, company loan), kept itemised.
+        List<PayslipLine> deductionLines = setup == null
+                ? List.of()
+                : resolveLineItems(setup.getDeductionsJson(), basic, "deduction");
+        BigDecimal named      = sumLines(deductionLines);
 
         // Approved leave whose type the company marks unpaid (LWOP by default) — days not worked
         // and not covered by credit, so they come off the pay.
@@ -426,10 +458,12 @@ public class PayrollService {
                 .periodEnd(periodEnd)
                 .basicSalary(basic)
                 .incentives(allowances)
+                .allowanceLines(new ArrayList<>(allowanceLines))
                 .overtimePay(overtimePay)
                 .overtimeBreakdown(ot.lines())
                 .grossPay(gross)
                 .absences(unpaid.amount())
+                .deductionLines(new ArrayList<>(deductionLines))
                 .sss(sss)
                 .philhealth(phi)
                 .pagibig(pag)
@@ -520,22 +554,46 @@ public class PayrollService {
 
     private record LineItem(String name, BigDecimal amount, String amountType, String schedule) {}
 
-    private BigDecimal sumLineItems(String json, BigDecimal basic) {
-        if (json == null || json.isBlank() || "[]".equals(json.trim())) return BigDecimal.ZERO;
+    /**
+     * Resolves the company's configured allowance/deduction items into named lines.
+     *
+     * <p>This used to return only a total, discarding each item's name — which is why an employee
+     * saw one "deductions" figure with nothing explaining it. The caller sums {@link #sumLines}
+     * these instead, so the breakdown and the total can't disagree: they come from one list.
+     *
+     * <p>Malformed JSON yields an empty list, so a bad configuration under-deducts rather than
+     * failing the run. That is a deliberate trade but a lossy one — see the warning log.
+     */
+    private List<PayslipLine> resolveLineItems(String json, BigDecimal basic, String what) {
+        if (json == null || json.isBlank() || "[]".equals(json.trim())) return List.of();
         try {
             LineItem[] items = objectMapper.readValue(json, LineItem[].class);
-            BigDecimal total = BigDecimal.ZERO;
+            List<PayslipLine> lines = new ArrayList<>();
             for (LineItem item : items) {
                 BigDecimal amt = nvl(item.amount());
                 if ("PERCENTAGE".equals(item.amountType())) {
                     amt = basic.multiply(amt.divide(BigDecimal.valueOf(100), 4, RoundingMode.HALF_UP));
                 }
-                total = total.add(amt);
+                amt = amt.setScale(2, RoundingMode.HALF_UP);
+                if (amt.signum() == 0) continue; // A zero line is noise on a payslip.
+                lines.add(new PayslipLine(
+                        item.name() == null || item.name().isBlank() ? what : item.name(), amt));
             }
-            return total.setScale(2, RoundingMode.HALF_UP);
+            return lines;
         } catch (Exception e) {
-            return BigDecimal.ZERO;
+            // Silently returning zero here previously meant a company's whole deduction set could
+            // vanish — over-paying an employee with nothing in the logs to explain it.
+            log.error("Malformed {} JSON — those lines are being skipped for this payslip: {}",
+                    what, json, e);
+            return List.of();
         }
+    }
+
+    private static BigDecimal sumLines(List<PayslipLine> lines) {
+        return lines.stream()
+                .map(l -> nvl(l.getAmount()))
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .setScale(2, RoundingMode.HALF_UP);
     }
 
     private static BigDecimal nvl(BigDecimal v) { return v != null ? v : BigDecimal.ZERO; }
