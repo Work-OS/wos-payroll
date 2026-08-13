@@ -13,7 +13,10 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 
@@ -38,7 +41,7 @@ public class PayrollController {
     }
 
     @GetMapping("/runs")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:VIEW_ALL_PAYSLIPS') or hasAuthority('PAYROLL_MANAGEMENT:MANAGE_PAYROLL')")
     public ResponseEntity<Page<PayrollRun>> getRuns(
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
@@ -70,19 +73,19 @@ public class PayrollController {
     public record CreateRunRequest(String periodStart, String periodEnd, List<Long> includedUserIds) {}
 
     @GetMapping("/runs/{id}/steps")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:VIEW_ALL_PAYSLIPS') or hasAuthority('PAYROLL_MANAGEMENT:MANAGE_PAYROLL')")
     public ResponseEntity<List<PayrollRunStep>> getSteps(@PathVariable Long id) {
         return ResponseEntity.ok(payrollService.getSteps(id));
     }
 
     @PostMapping("/runs/{id}/process")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:MANAGE_PAYROLL')")
     public ResponseEntity<PayrollRun> processRun(@PathVariable Long id) {
         return ResponseEntity.ok(payrollService.processRun(id));
     }
 
     @PostMapping("/runs/{id}/release")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('ADMIN') or hasAuthority('PAYROLL_MANAGEMENT:MANAGE_PAYROLL')")
     public ResponseEntity<PayrollRun> releaseRun(@PathVariable Long id) {
         return ResponseEntity.ok(payrollService.releaseRun(id));
     }
@@ -112,27 +115,55 @@ public class PayrollController {
         return ResponseEntity.ok(payrollService.getPayslips(runId, status, search, page, size));
     }
 
+    /**
+     * One payslip, by id.
+     *
+     * <p>The authority check can't live in {@code @PreAuthorize} alone: an employee is allowed to
+     * read their own, so the decision depends on the row. {@link PayrollService#getPayslipForCaller}
+     * makes it — managers see any within their company, everyone else only their own released one.
+     */
     @GetMapping("/payslips/{id}")
     @PreAuthorize("isAuthenticated()")
-    public ResponseEntity<Payslip> getPayslip(@PathVariable Long id) {
-        return ResponseEntity.ok(payrollService.getPayslip(id));
+    public ResponseEntity<Payslip> getPayslip(
+            @PathVariable Long id, @AuthenticationPrincipal UserDetails userDetails) {
+        return ResponseEntity.ok(
+                payrollService.getPayslipForCaller(id, username(userDetails), canViewAll()));
     }
 
     @GetMapping("/payslips/{id}/pdf")
     @PreAuthorize("isAuthenticated()")
-    public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
+    public ResponseEntity<byte[]> downloadPdf(
+            @PathVariable Long id, @AuthenticationPrincipal UserDetails userDetails) {
+        Payslip p = payrollService.getPayslipForCaller(id, username(userDetails), canViewAll());
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"payslip-" + id + ".pdf\"")
                 .contentType(MediaType.APPLICATION_PDF)
-                .body(payrollService.generatePayslipPdf(id));
+                .body(payrollService.generatePayslipPdf(p.getId()));
     }
 
     @GetMapping("/payslips/{id}/excel")
     @PreAuthorize("isAuthenticated()")
-    public ResponseEntity<byte[]> downloadExcel(@PathVariable Long id) {
+    public ResponseEntity<byte[]> downloadExcel(
+            @PathVariable Long id, @AuthenticationPrincipal UserDetails userDetails) {
+        Payslip p = payrollService.getPayslipForCaller(id, username(userDetails), canViewAll());
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"payslip-" + id + ".xlsx\"")
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .body(payrollService.generatePayslipExcel(id));
+                .body(payrollService.generatePayslipExcel(p.getId()));
+    }
+
+    private static String username(UserDetails userDetails) {
+        return userDetails == null ? null : userDetails.getUsername();
+    }
+
+    /** True for managers — those who may read anyone's payslip within the company. */
+    private static boolean canViewAll() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null) return false;
+        return auth.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority)
+                .anyMatch(a -> a.equals("ROLE_ADMIN")
+                        || a.equals("PAYROLL_MANAGEMENT:VIEW_ALL_PAYSLIPS")
+                        || a.equals("PAYROLL_MANAGEMENT:MANAGE_PAYROLL"));
     }
 }

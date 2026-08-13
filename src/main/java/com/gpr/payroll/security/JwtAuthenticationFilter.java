@@ -60,6 +60,21 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 Object rawId = claims.get("userRoleId");
                 Long userRoleId = rawId instanceof Number ? ((Number) rawId).longValue() : null;
 
+                // Scopes @TenantId entities (payslips, runs) to the caller's company for this
+                // request. The claim was always present — this service just never read it, so
+                // payroll data was global.
+                Object rawCompany = claims.get("companyId");
+                Long companyId = rawCompany instanceof Number ? ((Number) rawCompany).longValue() : null;
+                boolean superAdmin = Boolean.TRUE.equals(claims.get("super_admin", Boolean.class));
+                Long identityId = null;
+                try {
+                    identityId = claims.getSubject() == null ? null : Long.valueOf(claims.getSubject());
+                } catch (NumberFormatException ignored) {
+                    // Older tokens carried a non-numeric subject; identity-scoped checks fall back
+                    // to the email instead.
+                }
+                TenantContext.set(companyId, superAdmin, identityId);
+
                 List<SimpleGrantedAuthority> authorities = new ArrayList<>(permissionLoader.loadByUserRoleId(userRoleId));
                 if ("ADMIN".equalsIgnoreCase(role)) {
                     authorities.add(new SimpleGrantedAuthority("ROLE_ADMIN"));
@@ -79,7 +94,12 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             }
         }
 
-        filterChain.doFilter(request, response);
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            // Threads are pooled — a leaked context would scope the next request to the wrong company.
+            TenantContext.clear();
+        }
     }
 
     private String extractAccessToken(HttpServletRequest request) {

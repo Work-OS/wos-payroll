@@ -1,7 +1,9 @@
 package com.gpr.payroll.service;
 
 import com.gpr.common.entity.*;
+import com.gpr.kernel.exception.ResourceNotFoundException;
 import com.gpr.payroll.repository.*;
+import org.springframework.security.access.AccessDeniedException;
 import com.lowagie.text.Document;
 import com.lowagie.text.FontFactory;
 import com.lowagie.text.Paragraph;
@@ -361,6 +363,46 @@ public class PayrollService {
 
     public Payslip getPayslip(Long id) {
         return payslipRepo.findById(id).orElseThrow();
+    }
+
+    /**
+     * A payslip the caller is actually allowed to see.
+     *
+     * <p>{@code @TenantId} already keeps this within the caller's company, but within a company an
+     * employee must still only reach their own — otherwise anyone could walk the ids and read every
+     * salary. Managers (VIEW_ALL_PAYSLIPS / ADMIN) are exempt; everyone else is matched on the
+     * employee number their identity resolves to, and only for a released run, since an unreleased
+     * payslip is still a draft figure.
+     */
+    @Transactional(readOnly = true)
+    public Payslip getPayslipForCaller(Long id, String email, boolean canViewAll) {
+        Payslip p = payslipRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Payslip not found: " + id));
+        if (canViewAll) return p;
+
+        String ownEmployeeId = resolveEmployeeId(email);
+        if (ownEmployeeId == null || !ownEmployeeId.equals(p.getEmployeeId())) {
+            // Deliberately the same message either way: distinguishing "not yours" from "doesn't
+            // exist" would let someone map which payslip ids belong to whom.
+            throw new AccessDeniedException("Not your payslip");
+        }
+        // The RUN's status, matching what findMine lists on. Testing the payslip's own status
+        // instead would let a payslip appear in an employee's list yet 403 on download if the two
+        // ever drift — release sets both today, but the list is the contract to agree with.
+        String runStatus = p.getPayrollRun() == null ? null : p.getPayrollRun().getStatus();
+        if (!"released".equalsIgnoreCase(runStatus)) {
+            throw new AccessDeniedException("Payslip not released");
+        }
+        return p;
+    }
+
+    /** The employee number this identity is employed under, or null if it can't be resolved. */
+    private String resolveEmployeeId(String email) {
+        if (email == null) return null;
+        com.gpr.kernel.dto.UserSummaryDto identity = userDirectory.getByEmail(email);
+        if (identity == null || identity.getId() == null) return null;
+        List<User> employments = userRepo.findByUserId(identity.getId());
+        return employments.isEmpty() ? null : employments.get(0).getEmployeeId();
     }
 
     /**

@@ -20,9 +20,10 @@ spring:
         format_sql: true
         generate_statistics: true
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        # Mapping the shared @TenantId JobPosting turns multi-tenancy on; this service doesn't do
-        # per-request scoping, so use the no-op root resolver to satisfy Hibernate (no filtering).
-        tenant_identifier_resolver: com.gpr.common.tenant.RootTenantIdentifierResolver
+        # Discriminator multi-tenancy: scopes @TenantId entities (payslips, runs) to the active
+        # company per request. Was the no-op root resolver, which meant payroll data was global —
+        # any authenticated user of any company could read any payslip by id.
+        tenant_identifier_resolver: com.gpr.payroll.security.CompanyTenantResolver
 
 # Shared JWT secret with wos-auth — wos-payroll only validates tokens, never issues them.
 jwt:
