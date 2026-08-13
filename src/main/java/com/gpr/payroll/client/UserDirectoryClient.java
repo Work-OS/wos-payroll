@@ -75,6 +75,59 @@ public class UserDirectoryClient {
         }
     }
 
+    /**
+     * Company header details for a rendered document (payslip PDF), keyed by the template variable
+     * names the layout uses: {@code companyName}, {@code companyAddress}, {@code companyEmail},
+     * {@code companyPhone}.
+     *
+     * <p>Returns whatever resolves and blanks the rest — an incomplete header is fine, because the
+     * renderer skips lines that fill to nothing. A failure here must never stop a payslip being
+     * downloaded, so it degrades to an empty map rather than throwing.
+     */
+    public Map<String, String> getCompanyDetails(Long companyId) {
+        if (companyId == null) return Map.of();
+        try {
+            Map<?, ?> profile = restClient.get()
+                    .uri("/companies/{id}/profile", companyId)
+                    .retrieve()
+                    .body(Map.class);
+            if (profile == null) return Map.of();
+
+            Map<String, String> out = new java.util.LinkedHashMap<>();
+            // The name lives on the company record, not the profile (which holds only the editable
+            // "My Company" fields), so it takes a second call.
+            out.put("companyName", companyName(companyId));
+            // `address` is the postal one; `headquarters` is the city-level fallback.
+            String address = str(profile.get("address"));
+            out.put("companyAddress", address.isBlank() ? str(profile.get("headquarters")) : address);
+            out.put("companyEmail", str(profile.get("email")));
+            out.put("companyPhone", str(profile.get("phone")));
+            out.put("companyWebsite", str(profile.get("website")));
+            return out;
+        } catch (Exception e) {
+            log.warn("Company profile lookup failed for {}: {}", companyId, e.getMessage());
+            return Map.of();
+        }
+    }
+
+    /** Blank rather than throwing — a payslip without a company name still beats no payslip. */
+    private String companyName(Long companyId) {
+        try {
+            Map<?, ?> company = restClient.get()
+                    .uri("/companies/{id}", companyId)
+                    .retrieve()
+                    .body(Map.class);
+            return company == null ? "" : str(company.get("name"));
+        } catch (Exception e) {
+            log.warn("Company name lookup failed for {}: {}", companyId, e.getMessage());
+            return "";
+        }
+    }
+
+    private static String str(Object v) {
+        return v == null ? "" : String.valueOf(v);
+    }
+
     /** Resolves a single user summary by identity id, or null on miss / lookup failure. */
     public UserSummaryDto getSummary(Long id) {
         if (id == null) {

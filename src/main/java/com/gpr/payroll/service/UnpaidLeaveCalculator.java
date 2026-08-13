@@ -8,6 +8,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Deducts approved unpaid leave from a payslip.
@@ -52,7 +54,10 @@ public class UnpaidLeaveCalculator {
               AND lr.status = 'APPROVED'
               AND lr.deleted_at IS NULL
               AND lp.paid = false
-              AND lp.is_enabled = true
+              -- The column is `enabled`; `is_enabled` threw on every run, and because the failure
+              -- happens inside the run's transaction, Postgres aborted it and the payslip insert
+              -- died too. Unpaid leave was never deducted and no run could complete.
+              AND lp.enabled = true
               AND lr.start_date <= ?
               AND lr.end_date   >= ?
             """;
@@ -66,6 +71,12 @@ public class UnpaidLeaveCalculator {
         }
     }
 
+    /**
+     * Runs in its own transaction so the catch below is actually a soft failure. Sharing the run's
+     * transaction meant a SQL error here left Postgres in "current transaction is aborted", and the
+     * payslip insert that followed failed too — the exact opposite of the intent.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
     public Result compute(
             Long userId,
             Long companyId,
@@ -82,7 +93,7 @@ public class UnpaidLeaveCalculator {
             days = sum == null ? 0 : sum;
         } catch (Exception e) {
             // Never fail a payroll run over this: a missing deduction is visible and correctable,
-            // a crashed run blocks everyone's pay.
+            // a crashed run blocks everyone's pay. Only true because of REQUIRES_NEW above.
             log.warn("Unpaid-leave lookup failed for user {} in company {}: {}", userId, companyId, e.toString());
             return Result.none();
         }

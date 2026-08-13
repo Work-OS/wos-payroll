@@ -3,7 +3,6 @@ package com.gpr.payroll.service;
 import com.gpr.common.entity.*;
 import com.gpr.kernel.exception.ResourceNotFoundException;
 import com.gpr.payroll.repository.*;
-import org.springframework.security.access.AccessDeniedException;
 import com.lowagie.text.Document;
 import com.lowagie.text.FontFactory;
 import com.lowagie.text.Paragraph;
@@ -26,6 +25,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -69,6 +69,9 @@ public class PayrollService {
     private final OvertimePayCalculator    overtimePayCalculator;
     private final UnpaidLeaveCalculator    unpaidLeaveCalculator;
     private final SalaryResolver           salaryResolver;
+    private final com.gpr.payroll.client.TemplateClient templateClient;
+    private final com.gpr.payroll.client.NotificationClient notificationClient;
+    private final PayslipPdfRenderer       payslipPdfRenderer;
 
     // ── Stats ─────────────────────────────────────────────────────────────────
 
@@ -349,7 +352,45 @@ public class PayrollService {
         steps.forEach(s -> { s.setStatus("done"); s.setCompletedAt(LocalDateTime.now()); });
         stepRepo.saveAll(steps);
 
-        return runRepo.save(run);
+        PayrollRun saved = runRepo.save(run);
+        notifyReleased(run, payslips);
+        return saved;
+    }
+
+    /**
+     * Tells each employee their payslip is available.
+     *
+     * <p>Release previously changed statuses and told nobody, so a payslip appeared only if someone
+     * happened to look. Sent after the run is saved and never allowed to fail the release: the
+     * money event has already happened, and an unsent notification must not undo it.
+     */
+    private void notifyReleased(PayrollRun run, List<Payslip> payslips) {
+        if (payslips.isEmpty()) return;
+
+        // Payslips key on the employee number; notifications key on the identity id.
+        Map<String, Long> identityByEmployeeId = new HashMap<>();
+        for (User u : userRepo.findByActiveTrue()) {
+            if (u.getEmployeeId() != null && u.getUserId() != null) {
+                identityByEmployeeId.put(u.getEmployeeId(), u.getUserId());
+            }
+        }
+
+        int sent = 0;
+        for (Payslip p : payslips) {
+            Long userId = identityByEmployeeId.get(p.getEmployeeId());
+            if (userId == null) {
+                log.warn("No identity for employee {} — payslip release not notified", p.getEmployeeId());
+                continue;
+            }
+            notificationClient.notify(
+                    run.getCompanyId(), userId, "PAYSLIP_RELEASED",
+                    "Payslip available for " + run.getPeriod(),
+                    "Your payslip for " + run.getPeriodStart() + " to " + run.getPeriodEnd()
+                            + " is ready. Net pay: " + nvl(p.getNetPay()).setScale(2, RoundingMode.HALF_UP),
+                    "/dashboard/payroll");
+            sent++;
+        }
+        log.info("Payroll run {} released — notified {} of {} employees", run.getId(), sent, payslips.size());
     }
 
     // ── Payslips ──────────────────────────────────────────────────────────────
@@ -452,7 +493,7 @@ public class PayrollService {
         // Allowances (stored in incentives field for display), kept itemised alongside the total.
         List<PayslipLine> allowanceLines = setup == null
                 ? List.of()
-                : resolveLineItems(setup.getAllowancesJson(), basic, "allowance");
+                : resolveLineItems(setup.getAllowancesJson(), basic, "allowance", periodStart, periodEnd);
         BigDecimal allowances = sumLines(allowanceLines);
 
         // Overtime + holiday/rest-day premium pay from the employee's approved claims for this period,
@@ -476,7 +517,7 @@ public class PayrollService {
         // Named deductions from the setup (e.g. cash advance, company loan), kept itemised.
         List<PayslipLine> deductionLines = setup == null
                 ? List.of()
-                : resolveLineItems(setup.getDeductionsJson(), basic, "deduction");
+                : resolveLineItems(setup.getDeductionsJson(), basic, "deduction", periodStart, periodEnd);
         BigDecimal named      = sumLines(deductionLines);
 
         // Approved leave whose type the company marks unpaid (LWOP by default) — days not worked
@@ -606,12 +647,14 @@ public class PayrollService {
      * <p>Malformed JSON yields an empty list, so a bad configuration under-deducts rather than
      * failing the run. That is a deliberate trade but a lossy one — see the warning log.
      */
-    private List<PayslipLine> resolveLineItems(String json, BigDecimal basic, String what) {
+    private List<PayslipLine> resolveLineItems(
+            String json, BigDecimal basic, String what, LocalDate periodStart, LocalDate periodEnd) {
         if (json == null || json.isBlank() || "[]".equals(json.trim())) return List.of();
         try {
             LineItem[] items = objectMapper.readValue(json, LineItem[].class);
             List<PayslipLine> lines = new ArrayList<>();
             for (LineItem item : items) {
+                if (!appliesToPeriod(item.schedule(), periodStart, periodEnd)) continue;
                 BigDecimal amt = nvl(item.amount());
                 if ("PERCENTAGE".equals(item.amountType())) {
                     amt = basic.multiply(amt.divide(BigDecimal.valueOf(100), 4, RoundingMode.HALF_UP));
@@ -631,6 +674,41 @@ public class PayrollService {
         }
     }
 
+    /**
+     * Whether a configured line item falls due in this pay period.
+     *
+     * <p>The schedule an admin picks was previously parsed and ignored, so <em>every</em> item came
+     * off <em>every</em> run: a MONTHLY deduction was taken twice on semi-monthly payroll and a
+     * QUARTERLY one six times too often. Employees were under-paid.
+     *
+     * <p>Which cutoff a periodic item lands on is a convention, and this picks the earliest one in
+     * its cycle — the first payroll of the month, quarter, or year. Over the cycle the total is the
+     * same either way; only the timing differs. A cutoff is "first" when its period starts on or
+     * before the 15th, which is how semi-monthly periods are cut. Monthly payroll has one cutoff,
+     * so every schedule falls due on it.
+     */
+    private static boolean appliesToPeriod(String schedule, LocalDate start, LocalDate end) {
+        if (schedule == null || schedule.isBlank()) return true; // Unset behaves as every payroll.
+        if (start == null) return true;
+
+        // A period covering most of a month is the only cutoff that month, so nothing can be
+        // "missed" by waiting for a later one.
+        boolean singleCutoff = end != null && ChronoUnit.DAYS.between(start, end) >= 20;
+        boolean firstCutoff = singleCutoff || start.getDayOfMonth() <= 15;
+
+        return switch (schedule.toUpperCase()) {
+            case "EVERY_PAYROLL" -> true;
+            case "FIRST_PAYROLL" -> firstCutoff;
+            case "SECOND_PAYROLL" -> !firstCutoff;
+            case "MONTHLY" -> firstCutoff;
+            case "QUARTERLY" -> firstCutoff && (start.getMonthValue() - 1) % 3 == 0;
+            case "ANNUAL" -> firstCutoff && start.getMonthValue() == 1;
+            // An unrecognised schedule deducts rather than silently skipping: dropping a
+            // configured deduction over-pays, which is the worse failure.
+            default -> true;
+        };
+    }
+
     private static BigDecimal sumLines(List<PayslipLine> lines) {
         return lines.stream()
                 .map(l -> nvl(l.getAmount()))
@@ -642,48 +720,28 @@ public class PayrollService {
 
     // ── PDF ───────────────────────────────────────────────────────────────────
 
+    /**
+     * The payslip PDF, laid out by the company's configured template.
+     *
+     * <p>Previously a fixed sequence of paragraphs, so Configure → Communications → Payslip format
+     * had no effect on what an employee actually downloaded. The layout is fetched per render;
+     * if it cannot be, {@link PayslipPdfRenderer} falls back to a built-in arrangement rather than
+     * failing the download.
+     */
     public byte[] generatePayslipPdf(Long id) {
         Payslip p = getPayslip(id);
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        Map<String, Object> layout = templateClient.resolveLayout("PAYSLIP", p.getCompanyId());
+        return payslipPdfRenderer.render(p, layout, companyDetails(p.getCompanyId()));
+    }
+
+    /** Header details for the rendered document — best effort; a missing profile just renders blank. */
+    private Map<String, String> companyDetails(Long companyId) {
         try {
-            Document doc = new Document();
-            PdfWriter.getInstance(doc, baos);
-            doc.open();
-            doc.add(new Paragraph("PAYSLIP", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 18)));
-            doc.add(new Paragraph("Employee: " + p.getEmployeeName()));
-            doc.add(new Paragraph("Employee ID: " + p.getEmployeeId()));
-            doc.add(new Paragraph("Position: " + p.getPosition()));
-            doc.add(new Paragraph("Period: " + p.getPeriodStart() + " to " + p.getPeriodEnd()));
-            doc.add(new Paragraph(" "));
-            doc.add(new Paragraph("--- EARNINGS ---", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 12)));
-            doc.add(new Paragraph("Basic Salary: " + p.getBasicSalary()));
-            doc.add(new Paragraph("Allowances: " + p.getIncentives()));
-            if (p.getOvertimeBreakdown() != null && !p.getOvertimeBreakdown().isEmpty()) {
-                for (com.gpr.common.entity.PayslipOvertimeLine line : p.getOvertimeBreakdown()) {
-                    doc.add(new Paragraph(OvertimePayCalculator.label(line.getOvertimeType())
-                            + " (" + OvertimePayCalculator.hhmm(line.getHours()) + "): " + line.getAmount()));
-                }
-            } else if (p.getOvertimePay() != null && p.getOvertimePay().signum() > 0) {
-                doc.add(new Paragraph("Overtime/Premium Pay: " + p.getOvertimePay()));
-            }
-            doc.add(new Paragraph("Gross Pay: " + p.getGrossPay()));
-            doc.add(new Paragraph(" "));
-            doc.add(new Paragraph("--- DEDUCTIONS ---", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 12)));
-            doc.add(new Paragraph("SSS: " + p.getSss()));
-            doc.add(new Paragraph("PhilHealth: " + p.getPhilhealth()));
-            doc.add(new Paragraph("Pag-IBIG: " + p.getPagibig()));
-            doc.add(new Paragraph("Withholding Tax: " + p.getTax()));
-            doc.add(new Paragraph("Absences: " + p.getAbsences()));
-            doc.add(new Paragraph("Late Penalties: " + p.getLatePenalties()));
-            doc.add(new Paragraph("Cash Advances: " + p.getCashAdvances()));
-            doc.add(new Paragraph("Total Deductions: " + p.getTotalDeductions()));
-            doc.add(new Paragraph(" "));
-            doc.add(new Paragraph("NET PAY: " + p.getNetPay(), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 14)));
-            doc.close();
+            return userDirectory.getCompanyDetails(companyId);
         } catch (Exception e) {
-            throw new RuntimeException("PDF generation failed", e);
+            log.warn("Could not load company details for the payslip header: {}", e.getMessage());
+            return Map.of();
         }
-        return baos.toByteArray();
     }
 
     // ── Excel ─────────────────────────────────────────────────────────────────

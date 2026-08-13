@@ -10,11 +10,20 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 public interface PayslipRepository extends JpaRepository<Payslip, Long> {
+    /**
+     * Optional filters, so a null parameter means "don't filter on this".
+     *
+     * <p>The CASTs are load-bearing, not decoration. Postgres cannot infer the type of a bare null
+     * bind, so it defaults to {@code bytea} and {@code LOWER(CONCAT(…))} fails with
+     * "function lower(bytea) does not exist" — a 500 on the unfiltered payslip list, which is the
+     * default view. Same trap that hit the request repositories; see the CAST there too.
+     */
     @Query("SELECT p FROM Payslip p WHERE " +
-           "(:runId IS NULL OR p.payrollRun.id = :runId) " +
-           "AND (:status IS NULL OR p.status = :status) " +
-           "AND (:search IS NULL OR LOWER(p.employeeName) LIKE LOWER(CONCAT('%',:search,'%')) " +
-           "     OR LOWER(p.employeeId) LIKE LOWER(CONCAT('%',:search,'%')))")
+           "(CAST(:runId AS long) IS NULL OR p.payrollRun.id = :runId) " +
+           "AND (CAST(:status AS string) IS NULL OR p.status = :status) " +
+           "AND (CAST(:search AS string) IS NULL " +
+           "     OR LOWER(p.employeeName) LIKE LOWER(CONCAT('%', CAST(:search AS string), '%')) " +
+           "     OR LOWER(p.employeeId)   LIKE LOWER(CONCAT('%', CAST(:search AS string), '%')))")
     Page<Payslip> search(@Param("runId") Long runId,
                           @Param("status") String status,
                           @Param("search") String search,
